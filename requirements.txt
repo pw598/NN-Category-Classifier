@@ -1,0 +1,19 @@
+pandas>=2.0
+numpy>=1.24
+scipy>=1.10
+scikit-learn>=1.3
+matplotlib>=3.7
+joblib>=1.3
+
+# Neural networks (notebooks 03, 04, 06)
+torch>=2.0
+
+# Word2Vec, gensim backend (notebooks 04, 05, 07)
+gensim>=4.3
+
+# Leading-code stripping and the vocabulary filter (notebook 01)
+nltk>=3.8
+
+# optional
+pyarrow>=12.0      # parquet input/output
+openpyxl>=3.1      # reading/writing .xlsx golden sets

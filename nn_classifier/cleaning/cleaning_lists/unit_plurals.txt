@@ -1,0 +1,25 @@
+Unit_Plural
+Cubic Inches
+Centimeters
+Centimetres
+Cubic Yards
+Cubic Feet
+Mililiters
+Mililitres
+Milimeters
+Milimetres
+Kilograms
+Gallons
+Inches
+Liters
+Litres
+Meters
+Metres
+Ounces
+Pounds
+Quarts
+Spools
+Grams
+Pints
+Yards
+Feet

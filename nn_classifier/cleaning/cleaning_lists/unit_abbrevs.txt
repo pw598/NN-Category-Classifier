@@ -1,0 +1,32 @@
+Unit_Abbrev
+CU FT
+CU IN
+CU YD
+FTFT
+ININ
+GAL
+MIL
+TPI
+BG
+BX
+CA
+CM
+EA
+FT
+GR
+ID
+IN
+KG
+LB
+ML
+MM
+OD
+OZ
+PK
+PT
+QT
+YD
+G
+L
+M
+T

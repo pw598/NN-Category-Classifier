@@ -1,0 +1,29 @@
+Color
+Forest Green
+Royal Blue
+Navy Blue
+Turquoise
+Sky Blue
+Orange
+Purple
+Silver
+Violet
+Yellow
+Amber
+Beige
+Black
+Brown
+Clear
+Green
+Olive
+Pearl
+White
+Blue
+Gold
+Gray
+Grey
+Lime
+Navy
+Pink
+Red
+Tan
