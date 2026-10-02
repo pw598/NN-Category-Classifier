@@ -46,6 +46,26 @@ def _jsonable(obj: Any) -> Any:
     return str(obj)
 
 
+def _config_from_manifest(manifest: Dict[str, Any]) -> Any:
+    """The saved config, rebuilt from the manifest's JSON.
+
+    For bundles written before `config.joblib` existed. The sections
+    (`data`, `cleaning`, ...) come back as attribute-access objects,
+    which is all `predict` asks of a config; what is inside each
+    section is left as plain JSON values, so `marker_columns` is still
+    the dict of dicts the cleaning step takes.
+    """
+    from types import SimpleNamespace
+
+    raw = manifest.get("config")
+    if not isinstance(raw, dict):
+        return None
+    return SimpleNamespace(**{
+        section: (SimpleNamespace(**values) if isinstance(values, dict) else values)
+        for section, values in raw.items()
+    })
+
+
 def save_bundle(
     directory: str | Path,
     model: Any = None,
@@ -107,6 +127,14 @@ def save_bundle(
         if obj is not None:
             joblib.dump(obj, directory / f"{name}.joblib", compress=compress)
             written.append(f"{name}.joblib")
+
+    # The config as an object, beside the readable copy in the manifest.
+    # Scoring reads it to learn how the model has to be fed -- whether
+    # the descriptions it was trained on carried a vendor marker or code
+    # markers -- and must attach the same ones.
+    if config is not None:
+        joblib.dump(config, directory / "config.joblib", compress=compress)
+        written.append("config.joblib")
 
     if hierarchy_lookup is not None:
         hierarchy_lookup.to_csv(directory / "hierarchy_lookup.csv", index=False)
@@ -191,6 +219,26 @@ def load_bundle(
                  "word_vectors", "calibrators"):
         path = directory / f"{name}.joblib"
         out[name] = joblib.load(path) if path.is_file() else None
+
+    # The config the model was trained under. `predict` and the scoring
+    # notebooks read `bundle["config"]` to decide whether markers must be
+    # attached before scoring. This key used to be absent altogether, so
+    # that check always came back "no markers" and a marker-trained
+    # model was scored on descriptions missing the tokens it relies on:
+    # no error, and a worse answer on every row.
+    #
+    # A pickle that will not load -- the config classes have moved on
+    # since it was written -- falls back to the manifest rather than to
+    # None, because None is exactly the silent failure described above.
+    config_path = directory / "config.joblib"
+    config = None
+    if config_path.is_file():
+        try:
+            config = joblib.load(config_path)
+        except Exception as exc:                           # noqa: BLE001
+            print(f"[artifacts] config.joblib would not load "
+                  f"({type(exc).__name__}); using the manifest's copy")
+    out["config"] = config if config is not None else _config_from_manifest(manifest)
 
     lookup_path = directory / "hierarchy_lookup.csv"
     out["hierarchy_lookup"] = (
