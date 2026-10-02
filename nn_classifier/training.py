@@ -5,11 +5,19 @@ dense networks is the shape of a batch, and `to_device` already
 absorbs that. Two loops would be two places for the early-stopping
 rule or the loss weighting to drift apart, and that drift would look
 like a modelling result.
+
+`fit` can also be stopped and picked up again. Give it a
+`checkpoint_dir` and it saves its whole state at the end of an epoch
+and, when called again with the same directory, carries on from the
+epoch after -- same weights, same optimizer moments, same early-stopping
+count, same random-number state. Without a `checkpoint_dir` nothing
+about it has changed.
 """
 
 from __future__ import annotations
 
 import copy
+import dataclasses
 import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence
@@ -47,6 +55,14 @@ class History:
     # accuracy a loss-based restore would have discarded.
     best_epoch_by_loss: Optional[int] = None
     best_epoch_by_accuracy: Optional[int] = None
+    # False when fit() returned because it ran out of time rather than
+    # because training finished. The model then holds mid-training
+    # weights -- not the best ones -- and must not be evaluated or
+    # saved as though it were done. Call fit() again with the same
+    # checkpoint_dir to continue.
+    completed: bool = True
+    # The epoch a resumed run picked up after, or None for a fresh one.
+    resumed_from_epoch: Optional[int] = None
 
     def to_frame(self, level_columns: Optional[Sequence[str]] = None):
         import pandas as pd
@@ -254,6 +270,45 @@ def build_optimizer(
     return Optimizers(dense, sparse)
 
 
+def _model_signature(model: nn.Module) -> str:
+    """A hash of the parameter names and shapes.
+
+    What a checkpoint is checked against before it is loaded. The shapes
+    depend on the vocabulary and the label tree, so a checkpoint from
+    different data, a different fold or a different vectorizer setting
+    has a different signature -- and loading it would either fail on a
+    size mismatch or, worse, succeed on a coincidence.
+    """
+    import hashlib
+
+    parts = [f"{name}:{tuple(t.shape)}" for name, t in model.state_dict().items()]
+    return hashlib.sha1("|".join(parts).encode("utf-8")).hexdigest()[:16]
+
+
+# Settings that may change between sessions without making a resumed run
+# a different experiment: how long to go on for, and how the batches are
+# fetched. Everything else in NNConfig shapes the optimisation itself.
+_RESUMABLE_CFG_FIELDS = frozenset({"epochs", "patience", "num_workers", "prefer_gpu"})
+
+
+def _rng_state() -> dict:
+    import random
+
+    return {
+        "torch": torch.get_rng_state(),
+        "numpy": np.random.get_state(),
+        "python": random.getstate(),
+    }
+
+
+def _restore_rng_state(state: dict) -> None:
+    import random
+
+    torch.set_rng_state(state["torch"])
+    np.random.set_state(state["numpy"])
+    random.setstate(state["python"])
+
+
 def fit(
     model: nn.Module,
     train_loader,
@@ -262,8 +317,45 @@ def fit(
     level_columns: Optional[Sequence[str]] = None,
     device: Optional[str] = None,
     verbose: bool = True,
+    checkpoint_dir=None,
+    resume: bool = True,
+    deadline: Optional[float] = None,
+    checkpoint_every_seconds: float = 0.0,
+    checkpoint_max_file_mb: int = 400,
 ) -> History:
     """Train, with early stopping and a best-weight restore.
+
+    **Stopping and resuming.** With `checkpoint_dir` set, the full
+    training state is saved at the end of an epoch (see
+    `checkpoint.TrainingCheckpoint`). Calling `fit` again with the same
+    directory -- same model, same loaders, a fresh process -- continues
+    from the next epoch. The random-number state is part of what is
+    saved, so a run that was stopped and resumed produces the same
+    weights as one that was not -- wherever training is repeatable in
+    the first place. With `sparse_grad=True` it is repeatable only on
+    one thread (`torch.set_num_threads(1)`): two uninterrupted runs
+    from the same seed already differ on several, by the order
+    floating-point sums are taken in, and a resumed run differs from
+    either by no more than they differ from each other.
+
+      `deadline`  a `time.time()` value. Once it has passed, `fit`
+                  finishes the epoch in progress, saves, and returns
+                  with `history.completed = False`. The model is then
+                  mid-training: do not evaluate it, call `fit` again.
+      `resume`    False ignores and overwrites an existing checkpoint.
+      `checkpoint_every_seconds`
+                  the least time between saves. 0 saves every epoch,
+                  so a kill costs at most the epoch in progress. Raise
+                  it if the save is slow next to an epoch -- the time
+                  each one takes is printed.
+
+    A checkpoint is refused, loudly, if the model's parameter shapes do
+    not match it: that means different data or a different vectorizer,
+    and continuing would be training a different model from someone
+    else's optimizer state.
+
+    A hard kill (the cluster going away, an interrupt mid-epoch) loses
+    only what came after the last save.
 
     `cfg.monitor` decides what "best" means, and on this problem the
     choice is worth real accuracy.
@@ -318,7 +410,126 @@ def fit(
 
     names = list(level_columns) if level_columns else None
 
-    for epoch in range(1, cfg.epochs + 1):
+    # ---- resume ------------------------------------------------------
+    ckpt = None
+    start_epoch = 1
+    finished = False
+    saved_best_epoch = None          # the best_epoch the checkpoint holds
+    signature = _model_signature(model)
+    cfg_record = {k: (list(v) if isinstance(v, tuple) else v)
+                  for k, v in dataclasses.asdict(cfg).items()}
+
+    if checkpoint_dir is not None:
+        from .checkpoint import TrainingCheckpoint
+
+        ckpt = TrainingCheckpoint(checkpoint_dir, max_file_mb=checkpoint_max_file_mb)
+        if ckpt.exists() and not resume:
+            ckpt.clear()
+        if ckpt.exists():
+            state = ckpt.read_state()
+            if state.get("model_signature") != signature:
+                raise RuntimeError(
+                    f"The checkpoint in {ckpt.directory} was written for a "
+                    "model with different parameter shapes, so it comes from "
+                    "different data, a different fold, or different "
+                    "vectorizer or architecture settings. Resuming would "
+                    "train this model from another one's optimizer state.\n"
+                    "  Restore the settings that run used, or pass "
+                    "resume=False (or delete the directory) to start again."
+                )
+            changed = sorted(
+                k for k in set(cfg_record) | set(state.get("cfg", {}))
+                if k not in _RESUMABLE_CFG_FIELDS
+                and cfg_record.get(k) != state.get("cfg", {}).get(k)
+            )
+            if changed:
+                raise RuntimeError(
+                    f"The checkpoint in {ckpt.directory} was trained with "
+                    f"different settings for {changed}:\n"
+                    + "\n".join(
+                        f"    {k}: checkpoint {state.get('cfg', {}).get(k)!r}, "
+                        f"now {cfg_record.get(k)!r}" for k in changed)
+                    + "\n  A run resumed under changed settings is neither "
+                    "experiment. Restore them, or pass resume=False to start "
+                    "again."
+                )
+
+            model.load_state_dict(ckpt.load_part("model", map_location=device))
+            opt_state = ckpt.load_part("optim", map_location=device)
+            optimizer.dense.load_state_dict(opt_state["dense"])
+            if optimizer.sparse is not None and opt_state.get("sparse") is not None:
+                optimizer.sparse.load_state_dict(opt_state["sparse"])
+            scheduler.load_state_dict(opt_state["scheduler"])
+            best_state = ckpt.load_part("best", map_location=device)
+
+            history = History(**state["history"])
+            best_score = state["best_score"]
+            best_loss_seen = state["best_loss_seen"]
+            best_acc_seen = state["best_acc_seen"]
+            bad_epochs = state["bad_epochs"]
+            finished = bool(state["finished"])
+            start_epoch = int(state["epoch"]) + 1
+            saved_best_epoch = history.best_epoch
+            history.resumed_from_epoch = int(state["epoch"])
+            history.completed = True
+
+            # LengthBucketedBatches reshuffles from its own epoch counter.
+            sampler = getattr(train_loader, "batch_sampler", None)
+            if hasattr(sampler, "_epoch"):
+                sampler._epoch = int(state["epoch"])
+            # Last, so nothing above consumes from the restored stream.
+            _restore_rng_state(opt_state["rng"])
+
+            if verbose:
+                what = ("training had already finished"
+                        if finished else f"continuing at epoch {start_epoch}")
+                print(f"[fit] resumed from {ckpt.directory}: epoch "
+                      f"{state['epoch']} done, best so far epoch "
+                      f"{history.best_epoch} -- {what}")
+
+    last_save = time.time()
+
+    def _save_checkpoint(epoch: int, is_finished: bool) -> None:
+        nonlocal saved_best_epoch, last_save
+        parts = {
+            "model": model.state_dict(),
+            "optim": {
+                "dense": optimizer.dense.state_dict(),
+                "sparse": (optimizer.sparse.state_dict()
+                           if optimizer.sparse is not None else None),
+                "scheduler": scheduler.state_dict(),
+                "rng": _rng_state(),
+            },
+        }
+        carry = []
+        if best_state is not None:
+            if history.best_epoch != saved_best_epoch:
+                parts["best"] = best_state
+            else:
+                carry.append("best")
+        info = ckpt.save(
+            {
+                "epoch": epoch,
+                "finished": is_finished,
+                "model_signature": signature,
+                "cfg": cfg_record,
+                "history": dataclasses.asdict(history),
+                "best_score": best_score,
+                "best_loss_seen": best_loss_seen,
+                "best_acc_seen": best_acc_seen,
+                "bad_epochs": bad_epochs,
+            },
+            parts, carry=carry,
+        )
+        saved_best_epoch = history.best_epoch
+        last_save = time.time()
+        if verbose:
+            print(f"[fit] checkpoint saved after epoch {epoch} "
+                  f"({info['bytes'] / 1e6:,.0f} MB in {info['seconds']:.1f}s)")
+
+    va_acc: List[float] = history.val_acc[-1] if history.val_acc else []
+
+    for epoch in range(start_epoch, (0 if finished else cfg.epochs) + 1):
         started = time.time()
         tr_loss, tr_acc = run_epoch(
             model, train_loader, criterion, device, optimizer, cfg.level_loss_weights
@@ -376,14 +587,38 @@ def fit(
                 + ("  *" if improved else "")
             )
 
-        if bad_epochs >= cfg.patience:
+        stop_early = bad_epochs >= cfg.patience
+        done = stop_early or epoch >= cfg.epochs
+        out_of_time = (deadline is not None and time.time() >= deadline
+                       and not done)
+        if stop_early:
             history.stopped_early = True
+
+        if ckpt is not None and (
+            done or out_of_time
+            or time.time() - last_save >= checkpoint_every_seconds
+        ):
+            _save_checkpoint(epoch, done)
+
+        if stop_early:
             if verbose:
                 print(
                     f"[fit] stopping at epoch {epoch}; no improvement in "
                     f"{cfg.patience} epochs (best was epoch {history.best_epoch})"
                 )
             break
+
+        if out_of_time:
+            history.completed = False
+            if verbose:
+                where = (f" Saved to {ckpt.directory}; call fit() again with "
+                         "the same checkpoint_dir to continue."
+                         if ckpt is not None else
+                         " No checkpoint_dir was given, so this run cannot "
+                         "be resumed.")
+                print(f"[fit] out of time after epoch {epoch} of at most "
+                      f"{cfg.epochs}.{where}")
+            return history
 
     if best_state is not None:
         model.load_state_dict(best_state)
